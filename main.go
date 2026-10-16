@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -16,7 +18,7 @@ import (
 const (
 	hookMarkerStart = "# ttag hook - start"
 	hookMarkerEnd   = "# ttag hook - end"
-	version         = "1.1.1"
+	version         = "1.2.0"
 	focusIndicator  = "●"
 )
 
@@ -84,6 +86,13 @@ Usage:
   ttag upgrade                   Upgrade ttag to the latest version
   ttag hook [path]               (Used by shell hook) Apply colors for a path
   ttag version                   Print version
+
+Environment:
+  TTAG_COLOR_MODE=tab|background|both
+      tab (default)  native tab color (iTerm2, Windows Terminal, tmux),
+                     otherwise a colored emoji in the title
+      background     color the whole terminal background
+      both           tab color and background
 
 Examples:
   ttag set --color "#ff6b6b" --title "API"
@@ -325,9 +334,11 @@ func cmdHook(args []string) {
 		} else if !noTitle {
 			// Manual call without --no-title: reset color and title
 			fmt.Printf("%s\033]0;%s\a", resetSequences(), filepath.Base(pwd))
+			updateTmuxTab("", "")
 		} else {
 			// Hook call with --no-title: just reset color (hook handles title)
 			fmt.Print(resetSequences())
+			updateTmuxTab("", "")
 		}
 		return
 	}
@@ -342,15 +353,24 @@ func cmdHook(args []string) {
 		}
 	}
 
+	// Terminals with no tab/title bar color get a colored swatch in the title instead
+	if dc.Color != "" && usesSwatch(detectTerminal(), currentColorMode()) {
+		sr, sg, sb := parseHex(dc.Color)
+		title = swatchFor(sr, sg, sb) + " " + title
+	}
+
 	if titleOnly {
 		fmt.Print(title)
 		return
 	}
 
 	if dc.Color == "" {
+		// Title-only tag: clear any color left from a previously visited directory
+		fmt.Print(resetSequences())
 		if !noTitle {
 			fmt.Printf("\033]0;%s\a", title)
 		}
+		updateTmuxTab("", "")
 		return
 	}
 
@@ -363,6 +383,7 @@ func cmdHook(args []string) {
 		titleArg = ""
 	}
 	fmt.Print(colorSequences(r, g, b, fr, fg, fb, titleArg))
+	updateTmuxTab(dc.Color, fmt.Sprintf("#%02x%02x%02x", fr, fg, fb))
 }
 
 // ─── Terminal Detection ──────────────────────────────────────────────────────
@@ -373,18 +394,154 @@ const (
 	termStandard termType = iota
 	termWindowsTerminal
 	termITerm2
+	termAppleTerminal
+	termTmux
 )
 
 func detectTerminal() termType {
+	// tmux sets TMUX in every pane. Checked first because panes inherit
+	// WT_SESSION/TERM_PROGRAM from the terminal tmux was started in.
+	if os.Getenv("TMUX") != "" {
+		return termTmux
+	}
 	// Windows Terminal sets WT_SESSION on every pane
 	if os.Getenv("WT_SESSION") != "" {
 		return termWindowsTerminal
 	}
-	// iTerm2 identifies itself via TERM_PROGRAM
-	if os.Getenv("TERM_PROGRAM") == "iTerm.app" {
+	// iTerm2 and Apple Terminal identify themselves via TERM_PROGRAM
+	switch os.Getenv("TERM_PROGRAM") {
+	case "iTerm.app":
 		return termITerm2
+	case "Apple_Terminal":
+		return termAppleTerminal
 	}
 	return termStandard
+}
+
+// colorMode selects where the tag color is shown. Set with TTAG_COLOR_MODE.
+type colorMode int
+
+const (
+	modeTab        colorMode = iota // tab/title color (default)
+	modeBackground                  // whole-terminal background
+	modeBoth
+)
+
+func currentColorMode() colorMode {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("TTAG_COLOR_MODE"))) {
+	case "background", "bg":
+		return modeBackground
+	case "both":
+		return modeBoth
+	}
+	return modeTab
+}
+
+// hasNativeTabColor reports whether the terminal lets ttag color its tab directly.
+func hasNativeTabColor(t termType) bool {
+	return t == termITerm2 || t == termWindowsTerminal || t == termTmux
+}
+
+// usesTabColor reports whether the terminal's native tab color is set.
+func usesTabColor(t termType, m colorMode) bool {
+	return hasNativeTabColor(t) && m != modeBackground
+}
+
+// usesBackground reports whether the whole-terminal background (OSC 10/11) is colored.
+func usesBackground(m colorMode) bool {
+	return m != modeTab
+}
+
+// usesSwatch reports whether a colored emoji is prefixed to the title because the
+// terminal has no way to color its tab/title bar.
+func usesSwatch(t termType, m colorMode) bool {
+	return !hasNativeTabColor(t) && m != modeBackground
+}
+
+// tmuxTabArgs returns the tmux command that colors the status-bar tab of the
+// window holding this pane, or resets it to the user's tmux style when bg is empty.
+func tmuxTabArgs(bg, fg string) []string {
+	var args []string
+	for i, opt := range []string{"window-status-style", "window-status-current-style"} {
+		if i > 0 {
+			args = append(args, ";")
+		}
+		args = append(args, "set-option", "-w")
+		if bg == "" {
+			args = append(args, "-u")
+		}
+		if pane := os.Getenv("TMUX_PANE"); pane != "" {
+			args = append(args, "-t", pane)
+		}
+		args = append(args, opt)
+		if bg != "" {
+			args = append(args, "bg="+bg+",fg="+fg)
+		}
+	}
+	return args
+}
+
+// updateTmuxTab colors (or with an empty bg, resets) the tmux tab when running
+// inside tmux. tmux tabs are styled with tmux commands, not escape sequences.
+func updateTmuxTab(bg, fg string) {
+	if detectTerminal() != termTmux {
+		return
+	}
+	if !usesTabColor(termTmux, currentColorMode()) {
+		bg = ""
+	}
+	_ = exec.Command("tmux", tmuxTabArgs(bg, fg)...).Run()
+}
+
+// swatchFor returns the emoji square that best matches the given color.
+// It matches by hue (RGB distance maps light reds like #ff6b6b to brown),
+// with grays and dark colors mapped to black/white and dim oranges to brown.
+func swatchFor(r, g, b uint8) string {
+	rf, gf, bf := float64(r)/255, float64(g)/255, float64(b)/255
+	max := math.Max(rf, math.Max(gf, bf))
+	min := math.Min(rf, math.Min(gf, bf))
+	delta := max - min
+
+	if max < 0.35 {
+		return "⬛"
+	}
+	if delta/max < 0.15 { // low saturation: gray
+		if max < 0.5 {
+			return "⬛"
+		}
+		return "⬜"
+	}
+
+	var h float64
+	switch max {
+	case rf:
+		h = math.Mod((gf-bf)/delta, 6)
+	case gf:
+		h = (bf-rf)/delta + 2
+	default:
+		h = (rf-gf)/delta + 4
+	}
+	h *= 60
+	if h < 0 {
+		h += 360
+	}
+
+	switch {
+	case h >= 10 && h < 45 && max < 0.7:
+		return "🟫"
+	case h < 15 || h >= 335:
+		return "🟥"
+	case h < 40:
+		return "🟧"
+	case h < 70:
+		return "🟨"
+	case h < 170:
+		return "🟩"
+	case h < 255:
+		return "🟦"
+	default:
+		return "🟪"
+	}
 }
 
 // ─── ANSI / OSC Escape Sequences ────────────────────────────────────────────
@@ -392,21 +549,30 @@ func detectTerminal() termType {
 func colorSequences(r, g, b, fr, fg, fb uint8, title string) string {
 	var s strings.Builder
 	t := detectTerminal()
+	m := currentColorMode()
 
-	switch t {
-	case termITerm2:
-		fmt.Fprintf(&s, "\033]6;1;bg;red;brightness;%d\a", r)
-		fmt.Fprintf(&s, "\033]6;1;bg;green;brightness;%d\a", g)
-		fmt.Fprintf(&s, "\033]6;1;bg;blue;brightness;%d\a", b)
+	if usesTabColor(t, m) {
+		switch t {
+		case termITerm2:
+			fmt.Fprintf(&s, "\033]6;1;bg;red;brightness;%d\a", r)
+			fmt.Fprintf(&s, "\033]6;1;bg;green;brightness;%d\a", g)
+			fmt.Fprintf(&s, "\033]6;1;bg;blue;brightness;%d\a", b)
+		case termWindowsTerminal:
+			// WT extended palette: 264 = tab background, 263 = tab foreground (PR #13058)
+			fmt.Fprintf(&s, "\033]4;264;rgb:%02x/%02x/%02x\a", r, g, b)
+			fmt.Fprintf(&s, "\033]4;263;rgb:%02x/%02x/%02x\a", fr, fg, fb)
+		}
+	} else {
+		// Clear any tab color left over from another mode
+		s.WriteString(tabResetSequence(t))
+	}
 
-	case termWindowsTerminal:
-		// WT extended palette: 264 = tab background, 263 = tab foreground (PR #13058)
-		fmt.Fprintf(&s, "\033]4;264;rgb:%02x/%02x/%02x\a", r, g, b)
-		fmt.Fprintf(&s, "\033]4;263;rgb:%02x/%02x/%02x\a", fr, fg, fb)
-
-	default:
+	if usesBackground(m) {
 		fmt.Fprintf(&s, "\033]11;rgb:%02x/%02x/%02x\a", r, g, b)
 		fmt.Fprintf(&s, "\033]10;rgb:%02x/%02x/%02x\a", fr, fg, fb)
+	} else if !hasNativeTabColor(t) {
+		// Clear any background left over from another mode
+		s.WriteString("\033]110\a\033]111\a")
 	}
 
 	if title != "" {
@@ -419,18 +585,30 @@ func colorSequences(r, g, b, fr, fg, fb uint8, title string) string {
 func resetSequences() string {
 	var s strings.Builder
 	t := detectTerminal()
+	m := currentColorMode()
 
-	switch t {
-	case termITerm2:
-		s.WriteString("\033]6;1;bg;*;default\a")
-	case termWindowsTerminal:
-		s.WriteString("\033]104;263;264\a")
-	default:
+	// The tab color is reset in every mode so a mode switch never leaves it behind.
+	s.WriteString(tabResetSequence(t))
+
+	// Terminals without a native tab color always reset the background too,
+	// since their tab mode has no other way to clear one left by a previous mode.
+	if usesBackground(m) || !hasNativeTabColor(t) {
 		s.WriteString("\033]110\a")
 		s.WriteString("\033]111\a")
 	}
 
 	return s.String()
+}
+
+// tabResetSequence returns the sequence restoring the native tab color, if any.
+func tabResetSequence(t termType) string {
+	switch t {
+	case termITerm2:
+		return "\033]6;1;bg;*;default\a"
+	case termWindowsTerminal:
+		return "\033]104;263;264\a"
+	}
+	return ""
 }
 
 // ─── Color Utilities ─────────────────────────────────────────────────────────
@@ -758,13 +936,20 @@ func hookSnippet(shell string) string {
 			hookMarkerEnd
 
 	default: // bash
+		// Focus tracking needs bash 4.3+: older versions (including macOS's bash 3.2)
+		// cannot run bind -x on escape sequences and print "cannot find keymap for
+		// command" on every focus change. There the indicator is simply left off.
 		return hookMarkerStart + "\n" + versionLine +
-			"__ttag_focused=1\n" +
-			"printf '\\033[?1004h'\n" +
+			"__ttag_focus_ok=0\n" +
+			"if [ \"${BASH_VERSINFO[0]}\" -gt 4 ] || { [ \"${BASH_VERSINFO[0]}\" -eq 4 ] && [ \"${BASH_VERSINFO[1]}\" -ge 3 ]; }; then __ttag_focus_ok=1; fi\n" +
+			"__ttag_focused=$__ttag_focus_ok\n" +
 			"__ttag_focus_in() { __ttag_focused=1; if [ -n \"$__ttag_title_prefix\" ]; then printf '\\033]0;" + focusIndicator + " %s\\a' \"$__ttag_title_prefix\"; fi; }\n" +
 			"__ttag_focus_out() { __ttag_focused=0; if [ -n \"$__ttag_title_prefix\" ]; then printf '\\033]0;%s\\a' \"$__ttag_title_prefix\"; fi; }\n" +
-			"bind -x '\"\\e[I\": __ttag_focus_in'\n" +
-			"bind -x '\"\\e[O\": __ttag_focus_out'\n" +
+			"if [ \"$__ttag_focus_ok\" = \"1\" ]; then\n" +
+			"  printf '\\033[?1004h'\n" +
+			"  bind -x '\"\\e[I\": __ttag_focus_in'\n" +
+			"  bind -x '\"\\e[O\": __ttag_focus_out'\n" +
+			"fi\n" +
 			"__ttag_hook() {\n" +
 			"  local update_file=\"$HOME/.ttag_update\"\n" +
 			"  local update_time=\"\"\n" +
@@ -781,7 +966,7 @@ func hookSnippet(shell string) string {
 			"    export __ttag_last_pwd=\"$PWD\"\n" +
 			"    export __ttag_last_update=\"$update_time\"\n" +
 			"  fi\n" +
-			"  printf '\\033[?1004h'\n" +
+			"  if [ \"$__ttag_focus_ok\" = \"1\" ]; then printf '\\033[?1004h'; fi\n" +
 			"  if [ -n \"$__ttag_title_prefix\" ]; then\n" +
 			"    if [ \"$__ttag_focused\" = \"1\" ]; then\n" +
 			"      printf '\\033]0;" + focusIndicator + " %s\\a' \"$__ttag_title_prefix\"\n" +
@@ -790,7 +975,7 @@ func hookSnippet(shell string) string {
 			"    fi\n" +
 			"  fi\n" +
 			"}\n" +
-			"__ttag_cleanup() { printf '\\033[?1004l'; }\n" +
+			"__ttag_cleanup() { if [ \"$__ttag_focus_ok\" = \"1\" ]; then printf '\\033[?1004l'; fi; }\n" +
 			"trap '__ttag_cleanup' EXIT\n" +
 			"PROMPT_COMMAND=\"__ttag_hook${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"\n" +
 			hookMarkerEnd
